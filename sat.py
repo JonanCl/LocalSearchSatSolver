@@ -1,207 +1,276 @@
 import argparse
 import os
-import sys
+import random
 import time
 
 def read_cnf(path):
-    num_vars, clauses = 0, []
-    current = []
+    num_vars, clauses, current = 0, [], []
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("c") or line.startswith("%"):
+            if not line or line.startswith("c"):
                 continue
+            if line.startswith("%"):
+                break
             if line.startswith("p"):
-                _, _, n, _ = line.split()[:4]
-                num_vars = int(n)
+                num_vars = int(line.split()[2])
                 continue
             for tok in line.split():
                 lit = int(tok)
                 if lit == 0:
-                    clauses.append(current)
+                    if current:
+                        clauses.append(current)
                     current = []
                 else:
                     current.append(lit)
     if current:
         clauses.append(current)
+    clauses = clean(clauses)
     num_vars = max([num_vars] + [abs(l) for c in clauses for l in c])
     return num_vars, clauses
 
-def init_assignment(num_vars, value=1):
-    return [None] + [value] * num_vars
-
-def literal_value(lit, assignment):
-    v = assignment[abs(lit)]
-    return v if lit > 0 else 1 - v
-
-def evaluate(clauses, assignment):
-    table = [[literal_value(l, assignment) for l in clause] for clause in clauses]
-    row_sums = [sum(row) for row in table]
-    num_errors = sum(1 for s in row_sums if s == 0)
-    return table, row_sums, num_errors
-
-def count_errors(clauses, assignment):
-    return sum(1 for c in clauses if not any(literal_value(l, assignment) for l in c))
-
-def choose_start(num_vars, clauses):
-    all_one = init_assignment(num_vars, 1)
-    all_zero = init_assignment(num_vars, 0)
-    e1 = count_errors(clauses, all_one)
-    e0 = count_errors(clauses, all_zero)
-    if e0 > e1:
-        return all_zero, "all-0"
-    return all_one, "all-1"
-
-def state_key(assignment):
-    return bytes(assignment[1:])
-
-def rank_groups(clauses, table, row_sums):
-    error_count = {}
-    for clause, s in zip(clauses, row_sums):
-        if s == 0:
-            for var in {abs(l) for l in clause}:
-                error_count[var] = error_count.get(var, 0) + 1
-
-    if not error_count:
-        return [], {}
-
-    critical = {v: 0 for v in error_count}
-    for clause, row, s in zip(clauses, table, row_sums):
-        if s == 1:
-            v = abs(clause[row.index(1)])
-            if v in critical:
-                critical[v] += 1
-
-    groups = []
-    for count in sorted(set(error_count.values()), reverse=True):
-        members = sorted((v for v, c in error_count.items() if c == count),
-                         key=lambda v: (critical[v], v))
-        groups.append((count, members))
-    return groups, {"error_count": error_count, "critical": critical}
-
-def step(clauses, assignment, step_no, visited, verbose=True, stats=None):
-    say = print if verbose else (lambda *a, **k: None)
-    table, row_sums, errors = evaluate(clauses, assignment)
-    groups, info = rank_groups(clauses, table, row_sums)
-    if not groups:
-        return "solved"
-
-    if verbose:
-        say(f"--- step {step_no} (errors before: {errors}) ---")
-
-    for gi, (count, members) in enumerate(groups):
-        flipped = 0
-        for var in members:
-            old = assignment[var]
-            assignment[var] = 1 - old
-            key = state_key(assignment)
-            if key in visited:
-                assignment[var] = old
-                say(f"  skip x{var}: repeat state")
-                continue
-            visited.add(key)
-            flipped += 1
-            if stats is not None:
-                stats["flips"] += 1
-            errors_now = count_errors(clauses, assignment)
-            say(f"  flip x{var}: {old} -> {assignment[var]} (errors: {errors_now})")
-            if errors_now == 0:
-                return "ok"
-        if flipped:
-            return "ok"
-
-    return "stuck"
-
-def solve(clauses, num_vars, max_steps):
-    assignment = choose_start(num_vars, clauses)[0]
-    visited = {state_key(assignment)}
-    stats = {"flips": 0}
-    steps = 0
-    t0 = time.perf_counter()
-    
-    while True:
-        if count_errors(clauses, assignment) == 0:
-            status = "solved"
-            break
-        if steps >= max_steps:
-            status = "capped"
-            break
-        if step(clauses, assignment, steps + 1, visited, verbose=False, stats=stats) == "stuck":
-            status = "stuck"
-            break
-        steps += 1
-        
-    return {"status": status, "steps": steps, "flips": stats["flips"], "seconds": time.perf_counter() - t0}
-
-def interactive(path):
-    num_vars, clauses = read_cnf(path)
-    assignment, name = choose_start(num_vars, clauses)
-    print(f"Variables: {num_vars}, Clauses: {len(clauses)}, Start: {name}")
-
-    visited = {state_key(assignment)}
-    step_no = 1
-    
-    while True:
-        try:
-            cmd = input("\n[n = next step, n x = next x steps, t = table, q = quit] > ").split()
-        except EOFError:
-            break
-        if not cmd:
+def clean(clauses):
+    out = []
+    for c in clauses:
+        s = set(c)
+        if any(-l in s for l in s):
             continue
-        if cmd[0] == "q":
+        out.append(sorted(s, key=abs))
+    return out
+
+def init_all(n, clauses, occ, rng, val):
+    return [0] + [val] * n
+
+def init_random(n, clauses, occ, rng):
+    return [0] + [rng.randint(0, 1) for _ in range(n)]
+
+def init_majority(n, clauses, occ, rng):
+    a = [0] * (n + 1)
+    for v in range(1, n + 1):
+        p, q = len(occ[v + n]), len(occ[-v + n])
+        a[v] = 1 if p > q else 0 if q > p else rng.randint(0, 1)
+    return a
+
+def init_jw(n, clauses, occ, rng):
+    a = [0] * (n + 1)
+    for v in range(1, n + 1):
+        p = sum(2.0 ** -len(clauses[c]) for c in occ[v + n])
+        q = sum(2.0 ** -len(clauses[c]) for c in occ[-v + n])
+        a[v] = 1 if p > q else 0 if q > p else rng.randint(0, 1)
+    return a
+
+def init_greedy(n, clauses, occ, rng):
+    a = [0] * (n + 1)
+    sat = [False] * len(clauses)
+    order = sorted(range(1, n + 1), key=lambda v: -(len(occ[v + n]) + len(occ[-v + n])) + rng.random())
+    for v in order:
+        p = sum(2.0 ** -len(clauses[c]) for c in occ[v + n] if not sat[c])
+        q = sum(2.0 ** -len(clauses[c]) for c in occ[-v + n] if not sat[c])
+        a[v] = 1 if p > q else 0 if q > p else rng.randint(0, 1)
+        for c in occ[(v if a[v] else -v) + n]:
+            sat[c] = True
+    return a
+
+def init_unitprop(n, clauses, occ, rng):
+    a = [None] * (n + 1)
+    sat = [False] * len(clauses)
+    free = [len(c) for c in clauses]
+    queue = []
+
+    def assign(lit):
+        v = abs(lit)
+        if a[v] is not None:
+            return
+        a[v] = 1 if lit > 0 else 0
+        for c in occ[lit + n]:
+            sat[c] = True
+        for c in occ[-lit + n]:
+            free[c] -= 1
+            if not sat[c] and free[c] == 1:
+                queue.append(c)
+
+    def drain():
+        while queue:
+            c = queue.pop()
+            if sat[c]:
+                continue
+            for l in clauses[c]:
+                if a[abs(l)] is None:
+                    assign(l)
+                    break
+
+    for c, cl in enumerate(clauses):
+        if len(cl) == 1:
+            assign(cl[0])
+    drain()
+    order = sorted(range(1, n + 1), key=lambda v: -(len(occ[v + n]) + len(occ[-v + n])) + rng.random())
+    for v in order:
+        if a[v] is not None:
+            continue
+        p = sum(2.0 ** -len(clauses[c]) for c in occ[v + n] if not sat[c])
+        q = sum(2.0 ** -len(clauses[c]) for c in occ[-v + n] if not sat[c])
+        assign(v if (p > q or (p == q and rng.random() < 0.5)) else -v)
+        drain()
+    return [0] + [x if x is not None else 0 for x in a[1:]]
+
+INITS = {
+    "all1": lambda n, c, o, r: init_all(n, c, o, r, 1),
+    "all0": lambda n, c, o, r: init_all(n, c, o, r, 0),
+    "random": init_random,
+    "majority": init_majority,
+    "jw": init_jw,
+    "greedy": init_greedy,
+    "unitprop": init_unitprop,
+}
+
+class Solver:
+    def __init__(self, n, clauses):
+        self.n, self.clauses = n, clauses
+        self.occ = [[] for _ in range(2 * n + 1)]
+        for ci, c in enumerate(clauses):
+            for l in c:
+                self.occ[l + n].append(ci)
+
+    def load(self, a):
+        n, clauses, occ = self.n, self.clauses, self.occ
+        self.a = a[:]
+        m = len(clauses)
+        self.true_cnt = [0] * m
+        self.true_sum = [0] * m
+        self.brk = [0] * (n + 1)
+        self.unsat, self.pos = [], [-1] * m
+        for ci, c in enumerate(clauses):
+            for l in c:
+                if self.a[abs(l)] == (1 if l > 0 else 0):
+                    self.true_cnt[ci] += 1
+                    self.true_sum[ci] += abs(l)
+            if self.true_cnt[ci] == 0:
+                self._add_unsat(ci)
+            elif self.true_cnt[ci] == 1:
+                self.brk[self.true_sum[ci]] += 1
+
+    def _add_unsat(self, c):
+        self.pos[c] = len(self.unsat)
+        self.unsat.append(c)
+
+    def _del_unsat(self, c):
+        i, last = self.pos[c], self.unsat[-1]
+        self.unsat[i] = last
+        self.pos[last] = i
+        self.unsat.pop()
+        self.pos[c] = -1
+
+    def flip(self, v):
+        n, tc, ts, brk, occ = self.n, self.true_cnt, self.true_sum, self.brk, self.occ
+        new = 1 - self.a[v]
+        self.a[v] = new
+        gain = v if new else -v
+        for c in occ[gain + n]:
+            if tc[c] == 0:
+                self._del_unsat(c)
+                brk[v] += 1
+            elif tc[c] == 1:
+                brk[ts[c]] -= 1
+            tc[c] += 1
+            ts[c] += v
+        for c in occ[-gain + n]:
+            tc[c] -= 1
+            ts[c] -= v
+            if tc[c] == 0:
+                self._add_unsat(c)
+                brk[v] -= 1
+            elif tc[c] == 1:
+                brk[ts[c]] += 1
+
+    def run(self, max_flips, rng, cb=2.5):
+        clauses, brk = self.clauses, self.brk
+        lut = [cb ** -i for i in range(64)]
+        flips = 0
+        while self.unsat and flips < max_flips:
+            c = self.unsat[rng.randrange(len(self.unsat))]
+            cl = clauses[c]
+            ws = [lut[min(brk[abs(l)], 63)] for l in cl]
+            v = abs(rng.choices(cl, weights=ws)[0])
+            self.flip(v)
+            flips += 1
+        return not self.unsat, flips
+
+def solve(n, clauses, init="greedy", max_flips=200_000, tries=10, seed=0, noise=0.02, cb=2.5):
+    rng = random.Random(seed)
+    s = Solver(n, clauses)
+    total, t0 = 0, time.perf_counter()
+    first_unsat = 0
+    ok = False
+    for t in range(tries):
+        a = INITS[init](n, clauses, s.occ, rng)
+        if t > 0 and init != "random":
+            for v in range(1, n + 1):
+                if rng.random() < noise:
+                    a[v] ^= 1
+        s.load(a)
+        start_unsat = len(s.unsat)
+        ok, fl = s.run(max_flips, rng, cb)
+        total += fl
+        if t == 0:
+            first_unsat = start_unsat
+        if ok:
             break
-        elif cmd[0] == "t":
-            table, row_sums, errors = evaluate(clauses, assignment)
-            for clause, row, s in zip(clauses, table, row_sums):
-                print(f"{clause} -> {row} sum={s}")
-            print(f"errors: {errors}")
-        elif cmd[0] == "n":
-            count = int(cmd[1]) if len(cmd) > 1 and cmd[1].isdigit() else 1
-            for _ in range(count):
-                result = step(clauses, assignment, step_no, visited)
-                if result == "solved":
-                    print("SATISFIED!")
-                    return
-                if result == "stuck":
-                    print("Stuck :( )")
-                    return
-                step_no += 1
+    dt = time.perf_counter() - t0
+    return {"solved": ok, "flips": total, "tries": t + 1, "seconds": dt,
+            "init_unsat": first_unsat, "model": s.a if ok else None}
 
-def batch(folder, max_steps, limit, compare):
-    paths = sorted([os.path.join(root, f) for root, _, files in os.walk(folder) for f in files if f.endswith(".cnf")])
-    if limit:
-        paths = paths[:limit]
+def verify(clauses, a):
+    return all(any(a[abs(l)] == (1 if l > 0 else 0) for l in c) for c in clauses)
 
-    minisat = None
-    if compare:
-        from pysat.solvers import Minisat22
-        minisat = Minisat22
-
-    solved, total = 0, len(paths)
-    for i, path in enumerate(paths, 1):
-        num_vars, clauses = read_cnf(path)
-        res = solve(clauses, num_vars, max_steps)
-        print(f"[{i}/{total}] {os.path.basename(path)} -> {res['status']} ({res['steps']} steps, {res['flips']} flips)")
-        if res['status'] == "solved":
-            solved += 1
-        if minisat:
-            with minisat(bootstrap_with=clauses) as s:
-                print(f"  MiniSat: sat={s.solve()}")
-
-    print(f"\nFinished. Solved {solved}/{total} files.")
+def find_cnf(path):
+    if os.path.isfile(path):
+        return [path]
+    return sorted(os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.endswith(".cnf"))
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
-    ap.add_argument("--max-steps", type=int, default=5000)
+    ap.add_argument("--init", default="greedy")
+    ap.add_argument("--max-flips", type=int, default=200_000)
+    ap.add_argument("--tries", type=int, default=10)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--compare", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cb", type=float, default=2.5)
+    ap.add_argument("--minisat", action="store_true")
     args = ap.parse_args()
 
-    if os.path.isdir(args.path):
-        batch(args.path, args.max_steps, args.limit, args.compare)
-    elif os.path.isfile(args.path):
-        interactive(args.path)
+    paths = find_cnf(args.path)
+    if args.limit:
+        paths = paths[:args.limit]
+    inits = list(INITS) if args.init == "all" else [args.init]
+    stats = {i: [0, 0, 0.0, 0] for i in inits}
+
+    for p in paths:
+        n, clauses = read_cnf(p)
+        line = [f"{os.path.basename(p)} (n={n}, m={len(clauses)})"]
+        for i in inits:
+            r = solve(n, clauses, i, args.max_flips, args.tries, args.seed, cb=args.cb)
+            if r["solved"]:
+                assert verify(clauses, r["model"])
+            st = stats[i]
+            st[0] += r["solved"]; st[1] += r["flips"]; st[2] += r["seconds"]; st[3] += r["init_unsat"]
+            line.append(f"{i}: {'SAT' if r['solved'] else 'fail'} {r['flips']}fl")
+            
+            # Print the satisfying model assignment if solved
+            if r["solved"] and r["model"]:
+                model_out = " ".join(f"{v if val == 1 else -v}" for v, val in enumerate(r["model"][1:], 1))
+                print(f"    Solution: {model_out}")
+
+        print("  ".join(line))
+
+        if args.minisat:
+            from pysat.solvers import Minisat22
+            with Minisat22(bootstrap_with=clauses) as s:
+                t0 = time.perf_counter(); res = s.solve(); t1 = time.perf_counter() - t0
+            print(f"    MiniSat plain: sat={res} {t1:.4f}s")
+
+    for i, (sv, fl, sec, iu) in stats.items():
+        print(f"Init: {i} | Solved: {sv}/{len(paths)} | Total Flips: {fl}")
 
 if __name__ == "__main__":
     main()
